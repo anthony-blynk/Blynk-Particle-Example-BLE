@@ -15,6 +15,9 @@ BlynkInject::BlynkInject() {}
 bool BlynkInject::isUserConfiguring() {
     return _user_started_configuring && _ble.isConnected();
 }
+bool BlynkInject::isAppDisconnected() {
+    return _user_started_configuring && !_ble.isConnected();
+}
 
 void BlynkInject::begin(String name, String vendor, String tmpl_id, String fw_type, String fw_ver)
 {
@@ -27,8 +30,9 @@ void BlynkInject::begin(String name, String vendor, String tmpl_id, String fw_ty
     _fw_type = fw_type;
     _fw_ver = fw_ver;
     _user_started_configuring = false;
+    _last_status = STATUS_UNKNOWN;
 
-    _config.intf = _config.ssid = _config.pass = _config.auth = "";
+    clearRuntimeConfig();
 
 #ifdef NetMgr_WiFi
     NetMgrWiFi.startConfig();
@@ -48,9 +52,124 @@ void BlynkInject::end()
 {
     _ble.end();
     _started = false;
+    _last_status = STATUS_UNKNOWN;
+    _user_started_configuring = false;
     LOG_I_MOD("Provisioning finished");
 }
 
+void BlynkInject::reportStatus(InjectStatus status) {
+    if (!_started || !status) {
+        return;
+    }
+    if (_last_status == status) {
+        return;
+    }
+    char buff[128];
+    JsonBufferWriter writer(buff, sizeof(buff));
+    writer.beginObject();
+      writer["t"] = "status";
+      switch (status) {
+      case STATUS_UNKNOWN:                writer["s"] = "unknown";            break;
+      case STATUS_ERROR:                  writer["s"] = "error";              break;
+      case STATUS_CONNECTING_NETWORK:     writer["s"] = "connecting_net";     break;
+      case STATUS_CONNECTING_CLOUD:       writer["s"] = "connecting_cloud";   break;
+      case STATUS_CONNECTED:              writer["s"] = "connected";          break;
+      }
+    writer.endObject();
+    sendMsg(writer.buffer(), writer.dataSize());
+    _last_status = status;
+}
+
+void BlynkInject::reportNetStatus() {
+    if (!_started) return;
+    char buff[128];
+#ifdef NetMgr_WiFi
+    {
+        JsonBufferWriter writer(buff, sizeof(buff));
+        writer.beginObject();
+          writer["t"] = "net_status";
+          writer["if"] = "wifi";
+          writer["state"] = NetMgrWiFi.getStateStr();
+          writer["ssid"] = NetMgrWiFi.getNetworkSSID();
+          writer["bssid"] = NetMgrWiFi.getNetworkBSSID();
+          writer["ip"] = NetMgrWiFi.getLocalIP();
+          writer["rssi"] = NetMgrWiFi.getRSSI();
+        writer.endObject();
+        sendMsg(writer.buffer(), writer.dataSize());
+    }
+#endif
+#ifdef NetMgr_Ethernet
+    {
+        JsonBufferWriter writer(buff, sizeof(buff));
+        writer.beginObject();
+          writer["t"] = "net_status";
+          writer["if"] = "eth";
+          writer["state"] = NetMgrEthernet.getStateStr();
+        writer.endObject();
+        sendMsg(writer.buffer(), writer.dataSize());
+    }
+#endif
+#ifdef NetMgr_Cellular
+    {
+        JsonBufferWriter writer(buff, sizeof(buff));
+        writer.beginObject();
+          writer["t"] = "net_status";
+          writer["if"] = "cell";
+          writer["state"] = NetMgrCellular.getStateStr();
+          writer["operator"] = NetMgrCellular.getOperator();
+        writer.endObject();
+        sendMsg(writer.buffer(), writer.dataSize());
+    }
+#endif
+}
+
+void BlynkInject::sendError(const char* type, const char* reason, const String& msg) {
+    if (!_started || !type) {
+        return;
+    }
+
+    char buff[256];
+    JsonBufferWriter writer(buff, sizeof(buff));
+    writer.beginObject();
+      writer["t"] = type;
+      if (reason && reason[0]) {
+        writer["reason"] = reason;
+      }
+      if (msg.length()) {
+        writer["msg"] = msg;
+      }
+    writer.endObject();
+    sendMsg(writer.buffer(), writer.dataSize());
+    _last_status = STATUS_ERROR;
+}
+
+void BlynkInject::reportFailure(InjectError error, const String& msg) {
+    switch (error) {
+    case ERROR_NONE:                    break;
+    case ERROR_CONFIG:                  sendError("connect_fail", nullptr, msg); break;
+
+    case ERROR_CLOUD_TIMEOUT:           sendError("cloud_fail", "timeout", msg); break;
+    case ERROR_CLOUD_TOKEN:             sendError("cloud_fail", "auth_failed", msg); break;
+    case ERROR_CLOUD_GENERIC:           sendError("cloud_fail", "generic", msg); break;
+
+    case ERROR_NETWORK_TIMEOUT:         sendError("net_fail", "timeout", msg); break;
+    case ERROR_NETWORK_NOT_FOUND:       sendError("net_fail", "not_found", msg); break;
+    case ERROR_NETWORK_NO_CABLE:        sendError("net_fail", "no_cable", msg); break;
+    case ERROR_NETWORK_AUTH_FAIL:       sendError("net_fail", "invalid_credentials", msg); break;
+    case ERROR_NETWORK_NO_ADDRESS:      sendError("net_fail", "no_ip_assigned", msg); break;
+    case ERROR_NETWORK_GENERIC:         sendError("net_fail", "generic", msg); break;
+
+    case ERROR_SIMCARD_MISSING:         sendError("net_fail", "sim_missing", msg); break;
+    case ERROR_SIMCARD_LOCKED:          sendError("net_fail", "sim_locked", msg); break;
+    case ERROR_SIMCARD_WRONG_PIN:       sendError("net_fail", "sim_wrong_pin", msg); break;
+    }
+}
+
+void BlynkInject::clearRuntimeConfig() {
+    _config.intf = _config.ssid = _config.pass = _config.auth = "";
+    _config.host = _config.ip = _config.mask = _config.gw = _config.dns = _config.dns2 = "";
+    _config.forceSave = false;
+}
 
 void BlynkInject::run() {
     if (!_started) return;
@@ -117,7 +236,7 @@ void BlynkInject::parse_message() {
             }
         } else {
             LOG_W_MOD("Configuration invalid");
-            sendMsg(R"json({"t":"connect_fail","msg":"configuration invalid"})json");
+            reportFailure(ERROR_CONFIG, "configuration invalid");
         }
     } else if (t == "info") {
         LOG_I_MOD("Sending board info");
@@ -134,7 +253,6 @@ void BlynkInject::parse_message() {
           writer["fw_type" ] = _fw_type;
           writer["fw_ver"  ] = _fw_ver;
           writer["name"    ] = _name;
-          writer["last_error"] = (int)_last_error;
         writer.endObject();
         sendMsg(writer.buffer(), writer.dataSize());
     } else if (t == "ifs") {

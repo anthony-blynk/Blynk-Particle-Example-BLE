@@ -107,6 +107,23 @@ public:
 
     NetMgr.run();
 
+    _inject.run();
+    if (_inject.isAppDisconnected()) {
+      _inject.setUserFinishedConfiguring();
+      if (_state == MODE_RUNNING) {
+        _timer.setTimeout(1000L, [this]() {
+          _inject.end();
+        });
+      } else if (_state == MODE_CONNECTING_NET || _state == MODE_CONNECTING_CLOUD) {
+        BLYNK_LOG1(F("App disconnected, trying to connect anyway..."));
+        _timer.setTimeout(1000L, [this]() {
+          _inject.end();
+        });
+      } else {
+        restartProvisioning();
+      }
+    }
+
     switch (_state) {
     case MODE_IDLE:             stateIdle();              break;
     case MODE_WAIT_CONFIG:      stateConfig();            break;
@@ -139,7 +156,6 @@ private:
 
       setStateEntered();
     }
-    _inject.run();
     if (millis() - _stateChangeTime > _configTimeoutMs) {
       if (_inject.isUserConfiguring()) {
         _stateChangeTime = millis(); // restart timer
@@ -166,9 +182,7 @@ private:
 
   void stateConnectingNet() {
     if (isEnteringState()) {
-      if (_prevState == MODE_WAIT_CONFIG) {
-        _inject.end();
-      }
+      _inject.reportStatus(BlynkInject::STATUS_CONNECTING_NETWORK);
       NetMgr.allOn();
       setStateEntered();
     }
@@ -179,11 +193,11 @@ private:
     } else if (millis() - _stateChangeTime > WIFI_NET_CONNECT_TIMEOUT) {
       BLYNK_LOG1(F("Network connection timeout"));
       if (--_retriesNet <= 0) {
-        _inject.setLastError(BlynkInject::ERROR_NETWORK);
+        _inject.reportFailure(BlynkInject::ERROR_NETWORK_TIMEOUT);
 
         // If setting not saved -> return to config mode
         if (!_store.isSaved()) {
-          setState(MODE_WAIT_CONFIG);
+          restartProvisioning();
         } else {
           setState(MODE_ERROR);
         }
@@ -193,8 +207,17 @@ private:
     }
   }
 
+  void restartProvisioning() {
+    _isTokenInvalid = false;
+    _inject.clearRuntimeConfig();
+    setState(MODE_WAIT_CONFIG);
+  }
+
   void stateConnectingCloud() {
     if (isEnteringState()) {
+      _inject.reportNetStatus();
+      _inject.reportStatus(BlynkInject::STATUS_CONNECTING_CLOUD);
+
       Particle.connect();
 
       Blynk.config(_store.getBlynkAuth().c_str(),
@@ -208,13 +231,18 @@ private:
 
     if (Blynk.connected()) {
       if (!_store.isSaved()) {
-        _inject.setLastError(BlynkInject::ERROR_NONE);
         _store.commit();
+        if (!_store.isSaved()) {
+          _inject.reportFailure(BlynkInject::ERROR_CONFIG, "failed to store configuration");
+          restartProvisioning();
+          return;
+        }
 
         BLYNK_LOG1(F("Config saved."));
 
         if (_onInitialConnection) { _onInitialConnection(); }
       }
+      _inject.reportStatus(BlynkInject::STATUS_CONNECTED);
       _retriesCloud = WIFI_CLOUD_MAX_RETRIES;
       systemStats.trackConnected();
       setState(MODE_RUNNING);
@@ -240,19 +268,19 @@ private:
 
     } else if ((_isTokenInvalid = Blynk.isTokenInvalid())) {
       if (!_store.isSaved()) {
-        _inject.setLastError(BlynkInject::ERROR_TOKEN);
+        _inject.reportFailure(BlynkInject::ERROR_CLOUD_TOKEN);
       }
-      setState(MODE_WAIT_CONFIG); // TODO: retry after timeout
+      restartProvisioning(); // TODO: retry after timeout
     } else if (!NetMgr.isAnyConnected()) {
       setState(MODE_CONNECTING_NET);
     } else if (millis() - _stateChangeTime > WIFI_NET_CONNECT_TIMEOUT) {
       BLYNK_LOG1(F("Cloud connection timeout"));
       if (--_retriesCloud <= 0) {
-        _inject.setLastError(BlynkInject::ERROR_CLOUD);
+        _inject.reportFailure(BlynkInject::ERROR_CLOUD_TIMEOUT);
 
         // If setting not saved -> return to config mode
         if (!_store.isSaved()) {
-          setState(MODE_WAIT_CONFIG);
+          restartProvisioning();
         } else {
           setState(MODE_ERROR);
         }

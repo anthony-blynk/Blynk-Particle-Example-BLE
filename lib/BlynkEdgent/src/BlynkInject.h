@@ -21,13 +21,23 @@ public:
 
     typedef void (provisionCb_t)(void);
 
+    enum InjectStatus {
+        STATUS_UNKNOWN = 0,
+        STATUS_ERROR,
+        STATUS_CONNECTING_NETWORK,
+        STATUS_CONNECTING_CLOUD,
+        STATUS_CONNECTED,
+    };
+
     enum InjectError {
-        ERROR_NONE     =   0,    // All good
-        ERROR_CONFIG   = 700,    // Invalid config from app (malformed token,etc)
-        ERROR_NETWORK  = 701,    // Could not connect to the router
-        ERROR_CLOUD    = 702,    // Could not connect to the cloud
-        ERROR_TOKEN    = 703,    // Invalid token error (after connection)
-        ERROR_INTERNAL = 704,    // Other issues (i.e. hardware failure)
+        /* Note: 700-705 error codes kept for backward compatibility with old versions */
+        ERROR_NONE                  =   0,   // All good
+        ERROR_CONFIG                = 700,   // Invalid config from app (malformed token,etc)
+        ERROR_NETWORK_TIMEOUT       = 701,   // Could not connect to the router
+        ERROR_CLOUD_TIMEOUT         = 702,   // Could not connect to the cloud
+        ERROR_CLOUD_TOKEN           = 703,   // Invalid auth token error (after connection)
+        ERROR_NETWORK_GENERIC       = 704,   // Other issues (i.e. hardware failure, oom, etc)
+        ERROR_CLOUD_GENERIC         = 705,   // Other issues (i.e. protocol error, oom, etc)
 
         ERROR_NETWORK_NOT_FOUND  = 720,   // Network not found
         ERROR_NETWORK_NO_CABLE   = 721,   // Cable is disconnected
@@ -46,9 +56,16 @@ public:
     void end();
 
     bool isUserConfiguring();
+    bool isAppDisconnected();
+    void setUserFinishedConfiguring() { _user_started_configuring = false; }
 
     void setProvisionCallback(provisionCb_t* cb);
-    void setLastError(InjectError err) { _last_error = err; }
+
+    void reportStatus(InjectStatus status);
+    void reportFailure(InjectError error, const String& msg = "");
+    void reportNetStatus();
+
+    void clearRuntimeConfig();
 
     struct Config {
         String    intf, ssid, pass, auth, host;
@@ -57,6 +74,7 @@ public:
     } _config;
 
 private:
+    void sendError(const char* type, const char* reason, const String& msg);
     void parse_message();
 
     void sendMsg(const char* str) {
@@ -75,7 +93,7 @@ private:
     String        _tmpl_id;
     String        _fw_type;
     String        _fw_ver;
-    InjectError   _last_error = ERROR_NONE;
+    InjectStatus  _last_status = STATUS_UNKNOWN;
     bool          _user_started_configuring = false;
 
     provisionCb_t *provisionCb = nullptr;

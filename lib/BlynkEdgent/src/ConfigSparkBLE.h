@@ -20,13 +20,16 @@ public:
     ConfigBLE() {}
 
     void begin(const char* name) {
+        _name = name;
+        _active = true;
+
         BLE.on();
 
         if (!_queue_mutex) {
             _queue_mutex = new Mutex();
 
             _tx_char = new BleCharacteristic(nullptr,
-                            BleCharacteristicProperty::NOTIFY,
+                            BleCharacteristicProperty::NOTIFY | BleCharacteristicProperty::INDICATE,
                             CHARACTERISTIC_UUID_TX, SERVICE_UUID);
             _rx_char = new BleCharacteristic(nullptr,
                             BleCharacteristicProperty::WRITE_WO_RSP | BleCharacteristicProperty::WRITE,
@@ -34,36 +37,56 @@ public:
 
             BLE.addCharacteristic(*_tx_char);
             BLE.addCharacteristic(*_rx_char);
+
+            // Preferred connection parameters: 7.5-15ms interval, no slave latency, 2s supervision timeout
+            BLE.setPPCP(6, 12, 0, 200);
+
+            BLE.onConnected([this](const BlePeerDevice& peer) {
+                LOG_I("BLE connected");
+            });
+            BLE.onDisconnected([this](const BlePeerDevice& peer) {
+                LOG_I("BLE disconnected");
+                WITH_LOCK(*_queue_mutex) {
+                    while (!_rx_queue.empty()) {
+                        free(_rx_queue.front());
+                        _rx_queue.pop();
+                    }
+                }
+                if (_active) {
+                    startAdvertising();
+                }
+            });
+            BLE.onAttMtuExchanged([this](const BlePeerDevice& peer, size_t attMtu) {
+                LOG_I("BLE MTU updated: %u", (unsigned)attMtu);
+            });
         }
 
-        BleAdvertisingData advData, scanRspData;
-        advData.appendServiceUUID(SERVICE_UUID);
-
-        // Construct Scan Responce Data manually to bypass Particle limitation
-        //unsigned name_len = strlen(name);
-        //uint8_t buffer[32];
-        //buffer[0] = name_len+1;
-        //buffer[1] = BLE_SIG_AD_TYPE_COMPLETE_LOCAL_NAME;
-        //memcpy(&buffer[2], name, name_len);
-        //scanRspData.set(buffer, name_len+2);
-
-        // A bit cleaner way:
-        scanRspData.clear();
-        scanRspData.append(BleAdvertisingDataType::COMPLETE_LOCAL_NAME,
-                          (const uint8_t*)name, strlen(name));
-
-        // TODO: set device name in GENERIC_ACCESS_SVC->DEVICE_NAME_CHAR
-        // Particle seemingly lacks API to do that
-
-        BLE.advertise(&advData, &scanRspData);
+        startAdvertising();
     }
 
     void end() {
+        _active = false;
+
+        BLE.disconnectAll();
+        BLE.stopAdvertising();
         BLE.off();
+
+        if (_queue_mutex) {
+            WITH_LOCK(*_queue_mutex) {
+                while (!_rx_queue.empty()) {
+                    free(_rx_queue.front());
+                    _rx_queue.pop();
+                }
+            }
+        }
     }
 
     size_t write(const void* buf, size_t len) {
-        _tx_char->setValue((uint8_t*)buf, len);
+        ssize_t sent = _tx_char->setValue((const uint8_t*)buf, len, BleTxRxType::ACK);
+        if (sent < 0) {
+            LOG_E("BLE indicate failed: %d", (int)sent);
+            return 0;
+        }
 
         LOG_D("<< %s", buf);
         return len;
@@ -95,6 +118,29 @@ public:
 
 private:
 
+    void startAdvertising() {
+        BleAdvertisingData advData, scanRspData;
+        advData.appendServiceUUID(SERVICE_UUID);
+
+        // Construct Scan Responce Data manually to bypass Particle limitation
+        //unsigned name_len = strlen(name);
+        //uint8_t buffer[32];
+        //buffer[0] = name_len+1;
+        //buffer[1] = BLE_SIG_AD_TYPE_COMPLETE_LOCAL_NAME;
+        //memcpy(&buffer[2], name, name_len);
+        //scanRspData.set(buffer, name_len+2);
+
+        // A bit cleaner way:
+        scanRspData.clear();
+        scanRspData.append(BleAdvertisingDataType::COMPLETE_LOCAL_NAME,
+                          (const uint8_t*)_name.c_str(), _name.length());
+
+        // TODO: set device name in GENERIC_ACCESS_SVC->DEVICE_NAME_CHAR
+        // Particle seemingly lacks API to do that
+
+        BLE.advertise(&advData, &scanRspData);
+    }
+
     static void ble_data_callback(const uint8_t* data, size_t len,
                                   const BlePeerDevice& peer, void* self)
     {
@@ -114,6 +160,8 @@ private:
     }
 
 private:
+    String                  _name;
+    bool                    _active = false;
     std::queue<char*>       _rx_queue;
     Mutex*                  _queue_mutex = nullptr;
     BleCharacteristic*      _rx_char = nullptr;
