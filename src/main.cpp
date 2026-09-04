@@ -20,6 +20,10 @@
 #define BLYNK_TEMPLATE_ID "TMPL4fKqC2IdZ"
 #define BLYNK_TEMPLATE_NAME "blynk-particle-example"
 
+/* White labeling (use this ONLY if you have a branded Blynk App/server) */
+//#define BLYNK_VENDOR_PREFIX         "Blynk"
+//#define BLYNK_DEFAULT_SERVER        "my-dashboard.com"
+
 #include <Particle.h>
 #include "BlynkInjectHelper.h"
 
@@ -42,6 +46,19 @@ void setup() {
     waitFor(Serial.isConnected, 5000);
     Serial.println();
 
+    // This device is cellular-only - explicitly turn WiFi off rather than
+    // relying only on having no stored credentials. Safe alongside BLE:
+    // the WiFi+BLE combo radio's contention risk (see lib/NetMgr/src/NetMgr.h)
+    // is specifically about code turning WiFi *on*, not off.
+    WiFi.off();
+
+    // Register cloud functions *before* connecting - Particle.connect()
+    // (called inside doBlynkProvisioning()) triggers Device OS's one-time
+    // "Describe" message early in the handshake, well before
+    // doBlynkProvisioning() itself returns. Anything registered after that
+    // point wouldn't be included and would never show up in the console.
+    Particle.function("clearProvisioning", clearProvisioning);
+
     // One-time BLE provisioning: no-op if already provisioned (see
     // isAlreadyProvisioned() in BlynkInjectHelper.h).
     if (!doBlynkProvisioning()) {
@@ -49,16 +66,17 @@ void setup() {
         delay(1000); // let the log line flush over serial before reset
         System.reset();
     }
-
-    // Cloud function to wipe the stored provisioning state, so you can
-    // re-run the BLE provisioning flow for testing.
-    Particle.function("clearProvisioning", clearProvisioning);
 }
 
 void loop() {
     if (millis() - lastPublish >= PUBLISH_INTERVAL_MS) {
         lastPublish = millis();
         publishSensorData();
+    }
+
+    if (resetRequested) {
+        delay(1000); // let the clearProvisioning() call's return value flush over the cloud connection first
+        System.reset();
     }
 }
 

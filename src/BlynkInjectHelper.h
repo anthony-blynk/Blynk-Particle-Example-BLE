@@ -4,11 +4,18 @@
 #include <BlynkSysUtils.h>
 #include <httpc.h>
 
-#ifndef CONFIG_DEVICE_PREFIX
-#define CONFIG_DEVICE_PREFIX "Blynk"
+#ifndef BLYNK_VENDOR_PREFIX
+#define BLYNK_VENDOR_PREFIX "Blynk"
 #endif
 #ifndef BLYNK_DEFAULT_SERVER
 #define BLYNK_DEFAULT_SERVER "blynk.cloud"
+#endif
+// Cellular can take much longer than WiFi to associate (poor coverage, SIM
+// activation, carrier registration) - bound the wait so a device that never
+// gets online during provisioning reports a failure and retries instead of
+// hanging forever with no feedback.
+#ifndef PARTICLE_CONNECT_TIMEOUT_MS
+#define PARTICLE_CONNECT_TIMEOUT_MS (180000UL) // 3 minutes
 #endif
 
 
@@ -220,9 +227,21 @@ void saveProvisioned() {
     EEPROM.write(PROV_EEPROM_ADDR, PROV_MAGIC);
 }
 
+// Set by clearProvisioning() and acted on from loop() - resetting directly
+// inside a cloud function handler tears the device down before the RPC
+// return value can be sent back to the caller, so every call would time
+// out even though the underlying work already succeeded.
+bool resetRequested = false;
+
 int clearProvisioning(String args) {
+    LOG_W("clearProvisioning() called (args=\"%s\")", args.c_str());
     EEPROM.write(PROV_EEPROM_ADDR, 0);
-    // System.reset();
+    // Also drop Device OS's own stored WiFi credentials - otherwise its
+    // Connection Manager will keep preferring WiFi over cellular on its
+    // own, independent of anything the BLE provisioning flow does, making
+    // it impossible to test a genuinely fresh cellular-only provision.
+    WiFi.clearCredentials();
+    resetRequested = true;
     return 1;
 }
 
@@ -242,8 +261,8 @@ bool doBlynkInject() {
 
     _inject._config.host = BLYNK_DEFAULT_SERVER;
 
-    systemInit(CONFIG_DEVICE_PREFIX, "Device");
-    _inject.begin(systemGetDeviceName(), CONFIG_DEVICE_PREFIX, BLYNK_TEMPLATE_ID, "001", "0.0.0");
+    systemInit(BLYNK_VENDOR_PREFIX, "Device");
+    _inject.begin(systemGetDeviceName(), BLYNK_VENDOR_PREFIX, BLYNK_TEMPLATE_ID, "001", "0.0.0");
 
     while (!injectDone) {
         _inject.run();
@@ -251,6 +270,14 @@ bool doBlynkInject() {
             _inject.setUserFinishedConfiguring();
             LOG_W("App disconnected before completing provisioning");
             return false;
+        }
+        // clearProvisioning() can be called (and its handler run) while
+        // still stuck in this loop, well before setup() ever returns and
+        // loop() gets a chance to run - check for it here too, not just in
+        // loop(), otherwise the reset request just sits unnoticed.
+        if (resetRequested) {
+            LOG_W("Reset requested while waiting for BLE provisioning");
+            System.reset();
         }
         delay(10);
     }
@@ -300,9 +327,9 @@ int setDeviceIdMetaField() {
 bool doBlynkProvisioning() {
     Particle.connect();
 
-    // if (isAlreadyProvisioned()) {
-    //     return true;
-    // }
+    if (isAlreadyProvisioned()) {
+        return true;
+    }
 
     if (!doBlynkInject()) {
         _inject.end();
@@ -311,7 +338,20 @@ bool doBlynkProvisioning() {
 
     _inject.reportStatus(BlynkInject::STATUS_CONNECTING_CLOUD);
     LOG_I("Connecting to Particle...");
-    waitUntil(Particle.connected);
+    unsigned long connectStart = millis();
+    while (!Particle.connected()) {
+        if (millis() - connectStart >= PARTICLE_CONNECT_TIMEOUT_MS) {
+            LOG_E("Timed out waiting for Particle cloud connection");
+            _inject.reportFailure(BlynkInject::ERROR_NETWORK_TIMEOUT, "Timed out connecting to Particle");
+            _inject.end();
+            return false;
+        }
+        if (resetRequested) {
+            LOG_W("Reset requested while waiting for Particle cloud connection");
+            System.reset();
+        }
+        delay(100);
+    }
 
     if (provisionToken() != 0) {
         _inject.reportFailure(BlynkInject::ERROR_CLOUD_TOKEN, "Blynk provisioning failed");
