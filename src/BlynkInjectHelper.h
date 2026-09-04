@@ -1,6 +1,7 @@
 #pragma once
 #include "Particle.h"
 #include <BlynkInject.h>
+#include <BlynkSysUtils.h>
 #include <httpc.h>
 
 #ifndef CONFIG_DEVICE_PREFIX
@@ -92,9 +93,6 @@ MrY=
 -----END CERTIFICATE-----
 )EOF";
 
-// #define LOGD(fmt, ...)
-#define LOGD(fmt, ...) Serial.printf(fmt "\r\n", ##__VA_ARGS__)
-
 static bool headerNameIs(const char* name, const char* expected) {
    while (*name && *expected) {
       char a = *name++, b = *expected++;
@@ -122,177 +120,9 @@ static bool splitAbsoluteUrl(const String& url, String& host, String& path) {
    return host.length() > 0;
 }
 
-// Blynk's external API redirects the generic "blynk.cloud" host to the
-// actual regional server (e.g. via HTTP 308), so this follows redirects
-// rather than treating them as failures.
-static int do_https_get(const char* host, const int port, const char* path) {
-   String curHost = host;
-   String curPath = path;
-
-   for (int redirects = 0; redirects < 3; redirects++) {
-      HttpsClient client;
-      int ret = client.initTls(blynk_root_ca_cert, strlen(blynk_root_ca_cert) + 1);
-      if (ret != 0) {
-         LOGD("initTls failed: %d", ret);
-         return ret;
-      }
-
-      ret = client.connect((char*)curHost.c_str(), port);
-      if (ret != 0) {
-         LOGD("connect failed: %d", ret);
-         return ret;
-      }
-
-      ret = client.get(curPath.c_str());
-
-      uint16_t status = client.resp->status_code;
-      LOGD("%s HTTP status %d, %d byte(s) received", status == 200 ? "🟢" : "🔴", status, ret);
-      if (ret > 0) {
-         LOGD("body: %.*s", ret, client.resp->body); // (dynamic length)
-      }
-
-      if (status == 301 || status == 302 || status == 307 || status == 308) {
-         String location;
-         bool found = false;
-         for (int i = 0; i < client.resp->headers.size(); i++) {
-            if (headerNameIs(client.resp->headers.at(i).name, "Location")) {
-               location = client.resp->headers.at(i).value;
-               found = true;
-               break;
-            }
-         }
-         client.disconnect();
-
-         if (!found) {
-            LOGD("Redirect (%d) with no Location header", status);
-            return -1;
-         }
-
-         String newHost, newPath;
-         if (splitAbsoluteUrl(location, newHost, newPath)) {
-            LOGD("Redirected to host %s path %s", newHost.c_str(), newPath.c_str());
-            curHost = newHost;
-            curPath = newPath;
-         } else {
-            LOGD("Redirected to path %s", location.c_str());
-            curPath = location;
-         }
-         continue;
-      }
-
-      client.disconnect();
-      return status == 200 ? 0 : -1;
-   }
-
-   LOGD("Too many redirects");
-   return -1;
-}
-
-#define EEPROM_ADDR 0       // starting EEPROM address
-#define MAX_LEN 64          // max characters per string
-
-// --- Helper: write a String to EEPROM ---
-void eepromWriteString(int addr, const String &data, int maxLen) {
-    int len = data.length();
-    if (len > maxLen - 1) len = maxLen - 1;
-
-    EEPROM.write(addr, (uint8_t)len);     // store length
-    for (int i = 0; i < len; i++) {
-        EEPROM.write(addr + 1 + i, static_cast<uint8_t>(data.charAt(i)));
-    }
-    EEPROM.write(addr + 1 + len, 0);      // null terminator
-}
-
-// --- Helper: read a String from EEPROM ---
-String eepromReadString(int addr, int maxLen) {
-    int len = EEPROM.read(addr);
-    if (len <= 0 || len >= maxLen) return "";
-    char buffer[65];
-    for (int i = 0; i < len; i++) {
-        buffer[i] = EEPROM.read(addr + 1 + i);
-    }
-    buffer[len] = '\0';
-    return String(buffer);
-}
-
-// --- Save auth + host to EEPROM ---
-void saveAuthAndHost(const String &auth, const String &host) {
-    eepromWriteString(EEPROM_ADDR, auth, MAX_LEN);
-    eepromWriteString(EEPROM_ADDR + MAX_LEN, host, MAX_LEN);
-    // EEPROM.commit();
-}
-
-// --- Load auth + host from EEPROM ---
-void loadAuthAndHost(String &auth, String &host) {
-    auth = eepromReadString(EEPROM_ADDR, MAX_LEN);
-    host = eepromReadString(EEPROM_ADDR + MAX_LEN, MAX_LEN);
-}
-
-// --- Check if auth + host are saved ---
-bool isAlreadyProvisioned() {
-    String auth = eepromReadString(EEPROM_ADDR, MAX_LEN);
-    String host = eepromReadString(EEPROM_ADDR + MAX_LEN, MAX_LEN);
-    return (auth.length() > 0 && host.length() > 0);
-}
-
-// --- Clear auth + host ---
-int clearProvisioning(String args) {
-    EEPROM.write(EEPROM_ADDR, 0);                 // clear auth length
-    EEPROM.write(EEPROM_ADDR + MAX_LEN, 0);       // clear host length
-    // EEPROM.commit();
-    // System.reset();
-    return 1;
-}
-
-BlynkInject   _inject;
-
-void doBlynkInject() {
-    LOGD("doBlynkInject Blynk BLE provisioning ...");
-
-    static bool injectDone = false;
-    _inject.setProvisionCallback([]() {
-        injectDone = true;
-    });
-
-    _inject._config.host = BLYNK_DEFAULT_SERVER;
-
-    _inject.begin(CONFIG_DEVICE_PREFIX + System.deviceID(), CONFIG_DEVICE_PREFIX, BLYNK_TEMPLATE_ID, "001", "0.0.0");
-                
-    LOGD("***DBG doBlynkInject 2");
-    while (!injectDone) {
-        _inject.run();
-        delay(10);
-    }
-
-    _inject.end();
-    LOGD("***DBG doBlynkInject done");
-}
-
-int provisionToken() {
-    //  curl -v "https://fra.blynk-qa.com/external/api/provision?token=aZK8MPhAzdnYTvJRx1ETaYyHQWNshrHE&templateId=TMPL8To24gvBv"
-    LOGD("***DBG provisionToken 1");
-
-    String path = String::format(
-        "/external/api/provision?token=%s&templateId=%s",
-        _inject._config.auth.c_str(), BLYNK_TEMPLATE_ID);
-
-    LOGD("***DBG provisionToken 2: host %s path %s", _inject._config.host.c_str(), path.c_str());
-
-    int rc = do_https_get(_inject._config.host.c_str(), 443, path.c_str());    
-    return rc;
-
-}
-
-// Name of the Blynk device metadata field to store the Particle Device ID
-// in (case-sensitive, must match your Blynk template exactly). This is NOT
-// the same thing as a datastream/virtual pin.
-#ifndef BLYNK_DEVICE_ID_METAFIELD_NAME
-#define BLYNK_DEVICE_ID_METAFIELD_NAME "ParticleDeviceId"
-#endif
-
 // Percent-encodes a query parameter (RFC 3986 unreserved chars pass
 // through as-is; everything else, including spaces, is escaped).
-String urlEncode(const String &s) {
+static String urlEncode(const String &s) {
     String out;
     for (unsigned i = 0; i < s.length(); i++) {
         char c = s.charAt(i);
@@ -309,36 +139,195 @@ String urlEncode(const String &s) {
     return out;
 }
 
-int setDeviceIdMetaField() {
-    LOGD("***DBG setDeviceIdMetaField 1");
+// Blynk's external API redirects the generic "blynk.cloud" host to the
+// actual regional server (e.g. via HTTP 308), so this follows redirects
+// rather than treating them as failures. Returns 0 on a final HTTP 200,
+// -1 otherwise.
+static int do_https_get(const char* host, const int port, const char* path) {
+   String curHost = host;
+   String curPath = path;
 
+   for (int redirects = 0; redirects < 3; redirects++) {
+      HttpsClient client;
+      int ret = client.initTls(blynk_root_ca_cert, strlen(blynk_root_ca_cert) + 1);
+      if (ret != 0) {
+         LOG_E("initTls failed: %d", ret);
+         return ret;
+      }
+
+      ret = client.connect((char*)curHost.c_str(), port);
+      if (ret != 0) {
+         LOG_E("connect failed: %d", ret);
+         return ret;
+      }
+
+      ret = client.get(curPath.c_str());
+
+      uint16_t status = client.resp->status_code;
+      LOG_I("HTTP status %d, %d byte(s) received", status, ret);
+      if (ret > 0) {
+         LOG_I("body: %.*s", ret, client.resp->body); // (dynamic length)
+      }
+
+      if (status == 301 || status == 302 || status == 307 || status == 308) {
+         String location;
+         bool found = false;
+         for (int i = 0; i < client.resp->headers.size(); i++) {
+            if (headerNameIs(client.resp->headers.at(i).name, "Location")) {
+               location = client.resp->headers.at(i).value;
+               found = true;
+               break;
+            }
+         }
+         client.disconnect();
+
+         if (!found) {
+            LOG_E("Redirect (%d) with no Location header", status);
+            return -1;
+         }
+
+         String newHost, newPath;
+         if (splitAbsoluteUrl(location, newHost, newPath)) {
+            LOG_I("Redirected to host %s path %s", newHost.c_str(), newPath.c_str());
+            curHost = newHost;
+            curPath = newPath;
+         } else {
+            LOG_I("Redirected to path %s", location.c_str());
+            curPath = location;
+         }
+         continue;
+      }
+
+      client.disconnect();
+      return status == 200 ? 0 : -1;
+   }
+
+   LOG_E("Too many redirects");
+   return -1;
+}
+
+// All data comms happen via Particle (Particle.publish() + webhook), so the
+// device never needs the auth token or host again after provisioning - only
+// a flag recording that Blynk now has this device's Particle Device ID.
+#define PROV_EEPROM_ADDR 0
+#define PROV_MAGIC       0x5A // arbitrary marker distinguishing "provisioned" from erased flash
+
+bool isAlreadyProvisioned() {
+    return EEPROM.read(PROV_EEPROM_ADDR) == PROV_MAGIC;
+}
+
+void saveProvisioned() {
+    EEPROM.write(PROV_EEPROM_ADDR, PROV_MAGIC);
+}
+
+int clearProvisioning(String args) {
+    EEPROM.write(PROV_EEPROM_ADDR, 0);
+    // System.reset();
+    return 1;
+}
+
+BlynkInject   _inject;
+
+// Returns false if the app disconnected before completing provisioning
+// (i.e. before sending "connect"). BLE is left open either way - the
+// caller decides when to end() it.
+bool doBlynkInject() {
+    LOG_I("Starting BLE provisioning");
+
+    static bool injectDone = false;
+    injectDone = false;
+    _inject.setProvisionCallback([]() {
+        injectDone = true;
+    });
+
+    _inject._config.host = BLYNK_DEFAULT_SERVER;
+
+    systemInit(CONFIG_DEVICE_PREFIX, "Device");
+    _inject.begin(systemGetDeviceName(), CONFIG_DEVICE_PREFIX, BLYNK_TEMPLATE_ID, "001", "0.0.0");
+
+    while (!injectDone) {
+        _inject.run();
+        if (_inject.isAppDisconnected()) {
+            _inject.setUserFinishedConfiguring();
+            LOG_W("App disconnected before completing provisioning");
+            return false;
+        }
+        delay(10);
+    }
+
+    LOG_I("BLE provisioning complete");
+    return true;
+}
+
+// Name of the Blynk device metadata field to store the Particle Device ID
+// in (case-sensitive, must match your Blynk template exactly). This is NOT
+// the same thing as a datastream/virtual pin.
+#ifndef BLYNK_DEVICE_ID_METAFIELD_NAME
+#define BLYNK_DEVICE_ID_METAFIELD_NAME "ParticleDeviceId"
+#endif
+
+// Claims the auth token the app handed over via BLE. This is what makes
+// the device show as online/provisioned in the Blynk app.
+//  curl -v "https://fra.blynk-qa.com/external/api/provision?token=...&templateId=..."
+int provisionToken() {
+    String path = String::format(
+        "/external/api/provision?token=%s&templateId=%s",
+        _inject._config.auth.c_str(), BLYNK_TEMPLATE_ID);
+
+    LOG_I("Claiming token: host=%s path=%s", _inject._config.host.c_str(), path.c_str());
+
+    return do_https_get(_inject._config.host.c_str(), 443, path.c_str());
+}
+
+// Stores this device's Particle Device ID in a Blynk device metadata
+// field, so the Particle Integration webhook -> Blynk Data Converter can
+// authenticate it.
+int setDeviceIdMetaField() {
     String path = String::format(
         "/external/api/device/meta/update?token=%s&metaFieldName=%s&value=%s",
         _inject._config.auth.c_str(), urlEncode(BLYNK_DEVICE_ID_METAFIELD_NAME).c_str(),
         System.deviceID().c_str());
 
-    LOGD("***DBG setDeviceIdMetaField 2: host %s path %s", _inject._config.host.c_str(), path.c_str());
+    LOG_I("Setting device ID meta field: host=%s path=%s", _inject._config.host.c_str(), path.c_str());
 
-    int rc = do_https_get(_inject._config.host.c_str(), 443, path.c_str());    
-    return rc;
+    return do_https_get(_inject._config.host.c_str(), 443, path.c_str());
 }
 
-void doBlynkProvisioning() {
-    LOGD("***DBG doBlynkProvisioning");
-
+// Returns true once the device is provisioned and ready for normal
+// operation (either just now, or already, previously). Returns false if
+// provisioning failed or was abandoned - caller should not proceed into
+// normal operation in that case.
+bool doBlynkProvisioning() {
     Particle.connect();
 
-    if (isAlreadyProvisioned()) {
-        return;
+    // if (isAlreadyProvisioned()) {
+    //     return true;
+    // }
+
+    if (!doBlynkInject()) {
+        _inject.end();
+        return false;
     }
 
-    doBlynkInject();
-
-    Serial.print("Connecting to Particle ... ");
+    _inject.reportStatus(BlynkInject::STATUS_CONNECTING_CLOUD);
+    LOG_I("Connecting to Particle...");
     waitUntil(Particle.connected);
 
-    provisionToken();
-    setDeviceIdMetaField();    
-}
+    if (provisionToken() != 0) {
+        _inject.reportFailure(BlynkInject::ERROR_CLOUD_TOKEN, "Blynk provisioning failed");
+        _inject.end();
+        return false;
+    }
 
+    if (setDeviceIdMetaField() != 0) {
+        _inject.reportFailure(BlynkInject::ERROR_CLOUD_GENERIC, "Failed to set device metadata");
+        _inject.end();
+        return false;
+    }
+
+    saveProvisioned();
+    _inject.reportStatus(BlynkInject::STATUS_CONNECTED);
+    _inject.end();
+    return true;
+}
 

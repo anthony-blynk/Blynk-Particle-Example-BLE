@@ -29,7 +29,7 @@ public:
             _queue_mutex = new Mutex();
 
             _tx_char = new BleCharacteristic(nullptr,
-                            BleCharacteristicProperty::NOTIFY | BleCharacteristicProperty::INDICATE,
+                            BleCharacteristicProperty::NOTIFY,
                             CHARACTERISTIC_UUID_TX, SERVICE_UUID);
             _rx_char = new BleCharacteristic(nullptr,
                             BleCharacteristicProperty::WRITE_WO_RSP | BleCharacteristicProperty::WRITE,
@@ -82,13 +82,13 @@ public:
     }
 
     size_t write(const void* buf, size_t len) {
-        ssize_t sent = _tx_char->setValue((const uint8_t*)buf, len, BleTxRxType::ACK);
+        ssize_t sent = _tx_char->setValue((const uint8_t*)buf, len);
         if (sent < 0) {
-            LOG_E("BLE indicate failed: %d", (int)sent);
+            LOG_E("BLE notify failed: %d", (int)sent);
             return 0;
         }
 
-        LOG_D("<< %s", buf);
+        LOG_I("<< %.*s", (int)len, (const char*)buf);
         return len;
     }
 
@@ -152,7 +152,7 @@ private:
         char* msg = (char*)malloc(len+1);
         memcpy(msg, data, len);
         msg[len] = 0;   // Null-terminate string
-        LOG_D(">> %s", msg);
+        LOG_I(">> %s", msg);
         WITH_LOCK(*_queue_mutex) {
           _rx_queue.push(msg);
         }

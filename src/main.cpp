@@ -18,7 +18,6 @@
 // #define BLYNK_TEMPLATE_ID     "TMPxxxxxx"
 // #define BLYNK_TEMPLATE_NAME   "Device"
 #define BLYNK_TEMPLATE_ID "TMPL4fKqC2IdZ"
-// #define BLYNK_TEMPLATE_NAME "Blynk PArticle Example"
 #define BLYNK_TEMPLATE_NAME "blynk-particle-example"
 
 #include <Particle.h>
@@ -26,18 +25,10 @@
 
 SYSTEM_MODE(AUTOMATIC);
 
-SerialLogHandler logHandler(LOG_LEVEL_INFO);
-
-// Slugified Blynk Template Name (lowercase, hyphenated - no spaces/
-// punctuation). Used to build EVENT_NAME below, so Particle events are easy
-// to trace back to the Blynk template they feed. Template Name is used
-// rather than Template ID because the name is normally shared across
-// Dev/QA/Prod Blynk environments, while the ID differs per environment. Kept
-// separate from BLYNK_TEMPLATE_NAME above since that one holds the real,
-// human-readable template name used for BLE provisioning - avoid names
-// starting with "particle" or "spark", which are reserved and get silently
-// dropped by the Particle Cloud.
-// #define EVENT_TEMPLATE_SLUG "blynk-particle-example-ble"
+SerialLogHandler logHandler(LOG_LEVEL_INFO, {
+    { "app", LOG_LEVEL_TRACE },
+    { "blynk.inject", LOG_LEVEL_TRACE }
+});
 
 const char* EVENT_NAME = BLYNK_TEMPLATE_NAME "/data";
 const unsigned long PUBLISH_INTERVAL_MS = 30000;
@@ -53,7 +44,11 @@ void setup() {
 
     // One-time BLE provisioning: no-op if already provisioned (see
     // isAlreadyProvisioned() in BlynkInjectHelper.h).
-    doBlynkProvisioning();
+    if (!doBlynkProvisioning()) {
+        Log.error("Provisioning failed, rebooting to retry");
+        delay(1000); // let the log line flush over serial before reset
+        System.reset();
+    }
 
     // Cloud function to wipe the stored provisioning state, so you can
     // re-run the BLE provisioning flow for testing.
